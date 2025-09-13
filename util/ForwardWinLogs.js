@@ -5,7 +5,7 @@ export default function registerForwardWinlogs(client) {
   client.on('messageCreate', async (message) => {
     if (message.author.id === client.user?.id) return;
 
-    // Channel/guild filter (keep as-is)
+    // Source channel/guild filter (keep as-is)
     if (
       // test
       // message.guild?.id !== '1263192728884346913' ||
@@ -17,45 +17,44 @@ export default function registerForwardWinlogs(client) {
 
     const content = message.content.replace(/```/g, '');
     const lines = content.split('\n').map(l => l.trim()).filter(Boolean);
+    if (!lines.length) return;
 
-    console.log(`received message on channel starting with line ${lines[0]}`);
+    console.log(`received message on channel starting with line: ${lines[0]}`);
 
-    // Pull per-guild config set by /setup.
-    // Treat NULL/'' clan tags as wildcard (ALL).
+    // 🔁 GET ONLY ROWS WITH A NON-EMPTY CLAN TAG (no wildcard/ALL)
     const [rows] = await connection.execute(
       `SELECT guild_id,
               NULLIF(TRIM(tanks_clan_tag), '') AS tanks_clan_tag,
               NULLIF(TRIM(tanks_winlog_channel_id), '') AS tanks_winlog_channel_id
          FROM clan_discord_details
-        WHERE NULLIF(TRIM(tanks_winlog_channel_id), '') IS NOT NULL`
+        WHERE NULLIF(TRIM(tanks_winlog_channel_id), '') IS NOT NULL
+          AND NULLIF(TRIM(tanks_clan_tag), '') IS NOT NULL`
     );
 
-    // Build: tag -> recipients, and a wildcard recipients list
-    const tagMap = new Map();            // key = UPPER(tag)
-    const wildcard = [];                 // rows with no clan tag (ALL)
+    // tag -> recipients (UPPER)
+    const tagMap = new Map();
     const add = (k, val) => {
       const key = k.toUpperCase();
       if (!tagMap.has(key)) tagMap.set(key, []);
       tagMap.get(key).push(val);
     };
-
     for (const r of rows) {
-      const recipient = { guildId: r.guild_id, channelId: r.tanks_winlog_channel_id };
-      if (r.tanks_clan_tag) add(r.tanks_clan_tag, recipient);
-      else wildcard.push(recipient); // “ALL” via /setup (no clan tag provided)
+      add(r.tanks_clan_tag, { guildId: r.guild_id, channelId: r.tanks_winlog_channel_id });
     }
 
+    // Process each parsed line
     for (const line of lines) {
       const columns = line.split(/\s+/);
       if (columns.length < 7) continue;
 
       const clanTag = columns[2]?.trim();
-      const tagKey = (clanTag ?? '').toUpperCase();
+      if (!clanTag) continue;
+      const tagKey = clanTag.toUpperCase();
 
-      // Always log the raw line
+      // Always write to logs DB
       try {
         await writeWinLog({
-          ts: new Date(), // Date object avoids DATETIME parsing issues
+          ts: new Date(),
           level: 'info',
           source: 'discord:winlogs-forwarder',
           host: message.guild?.id ?? 'unknown',
@@ -65,7 +64,7 @@ export default function registerForwardWinlogs(client) {
             guildId: message.guild?.id ?? null,
             channelId: message.channel.id,
             authorId: message.author.id,
-            clanTag: clanTag || null,
+            clanTag,
             firstLine: lines[0] ?? null,
           },
         });
@@ -73,15 +72,10 @@ export default function registerForwardWinlogs(client) {
         console.error('writeWinLog failed:', e?.message || e);
       }
 
-      // Recipients = specific tag matches + ALL (wildcard) subscribers
-      const recipients = [
-        ...(tagMap.get(tagKey) ?? []),
-        ...wildcard,
-      ];
+      // ✅ ONLY forward to matching clan tag (no wildcard recipients)
+      const recipients = tagMap.get(tagKey) ?? [];
+      if (!recipients.length) continue;
 
-      if (recipients.length === 0) continue;
-
-      // Dedupe per (guildId:channelId)
       const seen = new Set();
       for (const r of recipients) {
         const key = `${r.guildId}:${r.channelId}`;
